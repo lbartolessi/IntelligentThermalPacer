@@ -1,0 +1,11 @@
+# IntelligentThermalPacer
+
+> Biblioteca cliente y demonio central de fondo para el control y pautado dinámico de concurrencia térmica proactiva (pacing) en entornos de cómputo intensivo bajo Linux.
+
+Este repositorio implementa un sistema distribuido y proactivo de control de temperatura de hardware (CPU/GPU) diseñado para evitar la degradación térmica por estrangulamiento de hardware (thermal throttling) mediante la limitación dinámica de concurrencia y restauración absoluta de estado.
+
+## Core Documentation
+
+* [llms-full.txt](file:///home/lbartolessi/Workspaces/IntelligentThermalPacer/llms-full.txt) : Documentación completa de referencia técnica, especificaciones de la API, protocolo IPC por socket, lógica del motor de pautado y calibración de hardware.
+* [README.md](file:///home/lbartolessi/Workspaces/IntelligentThermalPacer/README.md) : Manual de usuario e instrucciones detalladas de instalación, configuración, integración por GitHub, y ejemplos prácticos de uso.
+* [CLAUDE.md](file:///home/lbartolessi/Workspaces/IntelligentThermalPacer/CLAUDE.md) : Guía de desarrollo local, estándares de codificación, comandos de test y validación estática de tipos.

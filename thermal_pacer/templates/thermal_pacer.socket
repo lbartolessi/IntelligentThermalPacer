@@ -1,0 +1,12 @@
+[Unit]
+Description=Activation Socket for the IntelligentThermalPacer Daemon
+# Hardware thermal preservation
+
+[Socket]
+ListenStream=/var/run/thermal_pacer.sock
+SocketUser=root
+SocketGroup=thermal
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

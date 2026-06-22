@@ -1,0 +1,15 @@
+[Unit]
+Description=IntelligentThermalPacer Intelligent Thermal Regulation Daemon
+Requires=thermal_pacer.socket
+After=thermal_pacer.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m thermal_pacer.daemon
+ExecStopPost=/usr/bin/python3 -m thermal_pacer.daemon --restore-governors
+User=root
+Group=root
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

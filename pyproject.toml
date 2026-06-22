@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "intelligent-thermal-pacer"
+version = "1.0.0"
+description = "Distributed, proactive application-level thermal throttling for Linux systems."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "lbartolessi" },
+]
+keywords = [
+    "thermal",
+    "throttling",
+    "cpu",
+    "gpu",
+    "daemon",
+    "systemd",
+    "linux",
+    "performance",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Operating System Kernels :: Linux",
+    "Typing :: Typed",
+]
+dependencies = [
+    "psutil>=5.9",
+    "pynvml>=11.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/lbartolessi/IntelligentThermalPacer"
+Repository = "https://github.com/lbartolessi/IntelligentThermalPacer"
+"Bug Tracker" = "https://github.com/lbartolessi/IntelligentThermalPacer/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["thermal_pacer*"]
+
+[tool.setuptools.package-data]
+"thermal_pacer" = ["templates/*"]

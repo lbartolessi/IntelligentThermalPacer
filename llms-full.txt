@@ -1,0 +1,101 @@
+# Especificación Técnica de IntelligentThermalPacer (LLM-Ready)
+
+Este documento detalla la API, el protocolo de socket UNIX, el diseño del demonio de fondo y la lógica matemática del pautado térmico para uso directo por agentes de IA.
+
+## 1. Librería Cliente (API de Integración)
+La librería se expone mediante la interfaz `ThermalGuard` en `thermal_pacer/client.py`.
+
+### Gestor de Contexto: `ThermalGuard`
+Se utiliza para rodear bloques de código con carga de trabajo paralela o multihilo intensiva.
+
+```python
+from thermal_pacer.client import ThermalGuard
+
+# Uso recomendado del gestor de contexto
+with ThermalGuard(socket_path="/var/run/thermal_pacer.sock") as guard:
+    # Antes de iniciar una iteración o tarea de alta carga, se invoca pace()
+    guard.pace()
+    
+    # Ejecución de la tarea pesada
+    procesar_lote_intensivo()
+```
+
+### Comportamiento del Cliente
+1. **Conexión Inicial**: Al entrar en el contexto `with`, abre un socket de dominio UNIX (`AF_UNIX`, `SOCK_STREAM`) en la ruta configurada. Envía un mensaje JSON de inicialización vacío o comandos directos.
+2. **Método `.pace()`**:
+   - Envía la cadena de petición `{"command": "pace_check"}` serializada en JSON y terminada en nueva línea (`\n`).
+   - Lee la respuesta. Si recibe `{"action": "wait", "duration_ms": X}`, el cliente suspende el hilo actual usando `time.sleep(X / 1000.0)` para dar un respiro térmico al procesador. Si recibe `{"action": "continue"}`, continúa de inmediato.
+   - Si el socket no está disponible o se desconecta abruptamente, el cliente degrada con gracia y retorna de inmediato sin bloquear la ejecución (tolerancia a fallos).
+3. **Método `.get_concurrency_guidance()`**:
+   - Envía la cadena de petición `{"command": "get_guidance"}` terminada en `\n`.
+   - Lee la respuesta en formato `{"action": "guidance_reply", "decision": "DECISION"}`.
+   - Retorna una de las tres directivas: `"SCALE_UP"`, `"SCALE_DOWN"`, o `"HOLD"`.
+4. **Desconexión**: Al salir del contexto `with`, cierra el socket. El demonio decrementa el contador de clientes de forma segura.
+
+---
+
+## 2. Protocolo IPC sobre Socket UNIX
+La comunicación se realiza mediante líneas serializadas en JSON a través del socket de dominio UNIX en `/var/run/thermal_pacer.sock`.
+
+### Mensajes de Petición (Client -> Daemon)
+* **Pace Check**: `{"command": "pace_check"}`
+* **Get Guidance**: `{"command": "get_guidance"}`
+
+### Mensajes de Respuesta (Daemon -> Client)
+* **Continue**: `{"action": "continue"}`
+* **Wait**: `{"action": "wait", "duration_ms": 250}`
+* **Guidance Reply**: `{"action": "guidance_reply", "decision": "SCALE_DOWN"}`
+* **Error**: `{"action": "error", "code": "UNKNOWN_COMMAND"}`
+
+---
+
+## 3. Demonio de Fondo (Arquitectura del Servidor)
+Implementado en `thermal_pacer/daemon.py`, corre como un servidor multihilo `socketserver.ThreadingUnixStreamServer`.
+
+### Telemetría en Segundo Plano
+* Un hilo dedicado ejecuta un bucle infinito que consulta la temperatura máxima de los sensores térmicos de hardware cada 1 segundo (CPU y GPU Nvidia opcional).
+* Mantiene un contador interno de las peticiones `pace_check` y de las respuestas `wait` en cada intervalo de 1 segundo.
+* Almacena estos datos en una cola deslizante (`collections.deque`) de longitud fija configurable (`trend_analysis_window_seconds`, por defecto 180).
+
+### Algoritmo de Toma de Decisiones
+La ventana de telemetría de 180 segundos se divide en 3 segmentos de igual duración (por defecto, 60 segundos cada uno):
+1. **Segmento Prior** ($T_{\text{prior}}$): De $t - 180$ a $t - 120$ segundos.
+2. **Segmento Previous** ($T_{\text{prev}}$): De $t - 120$ a $t - 60$ segundos.
+3. **Segmento Current** ($T_{\text{current}}$): De $t - 60$ a $t$ segundos.
+
+Se definen dos indicadores fundamentales para la evaluación de la guía:
+* **Relación de Esperas del Segmento Actual ($R_e(\text{Current})$)**:
+  $$R_e = \frac{\sum \text{pace\_waits}}{\sum \text{pace\_calls}}$$
+* **Tasa de Calentamiento de la Ventana ($\Delta T_{\text{min}}$)**:
+  $$\Delta T_{\text{min}} = \frac{T_{\text{avg}}(\text{Current}) - T_{\text{avg}}(\text{Prior})}{\text{span\_minutes}}$$
+  Donde $\text{span\_minutes} = 2.0$ minutos (120 segundos entre los centros del segmento Prior y Current).
+
+### Directivas de Guidance (Criterios de Transición)
+1. **SCALE_DOWN**: Se activa si se cumple cualquiera de las siguientes condiciones:
+   - Hay tendencia de calentamiento al alza sostenida y rápida:
+     $$T_{\text{avg}}(\text{Current}) > T_{\text{avg}}(\text{Previous}) > T_{\text{avg}}(\text{Prior}) \quad \text{y} \quad \Delta T_{\text{min}} > 0.5\ ^\circ\text{C/min}$$
+   - El ratio de estrangulamiento actual es elevado:
+     $$R_e(\text{Current}) > 0.40$$
+2. **SCALE_UP**: Se activa solo si se cumplen simultáneamente:
+   - Todas las temperaturas de la ventana están bajo el umbral de seguridad:
+     $$T < T_{\text{max}} - T_{\text{safety}} \quad \forall t \in \text{Window}$$
+   - La pendiente térmica es plana o decreciente:
+     $$T_{\text{avg}}(\text{Current}) \le T_{\text{avg}}(\text{Prior})$$
+   - El ratio de esperas acumulado en toda la ventana es nulo:
+     $$R_e(\text{Window}) == 0.0$$
+3. **HOLD**: Estado por defecto en caso de no cumplirse ninguna de las anteriores o durante la fase de calentamiento inicial (cuando el tiempo transcurrido del demonio es menor a la duración total de la ventana).
+
+---
+
+## 4. Calibración de Hardware y Gobernadores
+Implementado en `thermal_pacer/calibration.py`.
+
+### Ciclo de Tres Fases de Estrés
+1. **Fase 1 (Stress FPU - Cómputo Puro)**: Multiplicación masiva de matrices grandes en todos los hilos del sistema en bucle continuo durante 60 segundos. Determina la respuesta térmica ante carga puramente de cálculo.
+2. **Fase 2 (Stress I/O)**: Escritura concurrente y masiva de bloques aleatorios en disco con llamadas `fsync()`.
+3. **Fase 3 (Stress Mixto)**: Combina ambas cargas para simular cargas extremas reales del servidor.
+
+### Protección de Gobernadores y CPU Boost
+* **Backup de Estado**: Al arrancar, el demonio respalda los gobernadores activos y el estado de CPU boost (Intel/AMD) en el archivo de recuperación `/var/run/thermal_pacer.governors.bak`.
+* **Restauración en Desconexión**: Cuando el contador de clientes conectados al socket desciende a 0, el demonio ejecuta una restauración absoluta leyendo `/var/run/thermal_pacer.governors.bak`, revierte los gobernadores y la frecuencia boost, borra el archivo de backup y realiza un `os._exit(0)`.
+* **Restauración Fuera de Banda (OOB)**: Para fallos catastróficos o paradas por SIGKILL, systemd invoca `ExecStopPost=python3 -m thermal_pacer.daemon --restore-governors` para restaurar el sistema físico de manera robusta y evitar estados de CPU degradados.

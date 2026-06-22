@@ -1,0 +1,27 @@
+# Entornos virtuales y dependencias
+.venv/
+venv/
+ENV/
+env/
+
+# Compilación y empaquetado de Python
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Caché y archivos temporales
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Respaldos térmicos fuera de banda y sockets locales
+/thermal_pacer/templates/*.service.tmp
+/thermal_pacer/templates/*.socket.tmp
+*.bak
+*.tmp
+/var/run/thermal_pacer.sock
