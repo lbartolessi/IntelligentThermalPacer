@@ -93,7 +93,7 @@ def load_config(path: str = CONFIG_PATH) -> DaemonConfig:
         cfg.trend_analysis_window_seconds = int(sm.get("trend_analysis_window_seconds", cfg.trend_analysis_window_seconds))
         cfg.emit_warnings = bool(sm.get("emit_warnings", cfg.emit_warnings))
 
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"[ThermalPacer] Config load warning ({exc}); using defaults.", file=sys.stderr)
 
     return cfg
@@ -133,10 +133,8 @@ class LiveTelemetryProvider:
             except Exception:
                 pass  # GPU unavailable – degrade gracefully
 
-    def get_critical_temperature(self) -> float:
+    def _get_cpu_temps(self) -> list[float]:
         temps: list[float] = []
-
-        # --- CPU via psutil ---
         try:
             import psutil  # type: ignore[import]
             sensor_data = psutil.sensors_temperatures()
@@ -145,24 +143,30 @@ class LiveTelemetryProvider:
                 if key in cpu_keys:
                     for entry in entries:
                         temps.append(entry.current)
-            # If no known key matched, take the global maximum
             if not temps:
                 for entries in sensor_data.values():
                     for entry in entries:
                         temps.append(entry.current)
         except Exception:
             pass
+        return temps
 
-        # --- GPU via pynvml ---
+    def _get_gpu_temp(self) -> Optional[float]:
         if self._nvml is not None and self._nvml_handle is not None:
             try:
                 gpu_temp = self._nvml.nvmlDeviceGetTemperature(  # type: ignore[attr-defined]
                     self._nvml_handle, self._nvml.NVML_TEMPERATURE_GPU  # type: ignore[attr-defined]
                 )
-                temps.append(float(gpu_temp))
+                return float(gpu_temp)
             except Exception:
                 pass
+        return None
 
+    def get_critical_temperature(self) -> float:
+        temps = self._get_cpu_temps()
+        gpu_temp = self._get_gpu_temp()
+        if gpu_temp is not None:
+            temps.append(gpu_temp)
         return max(temps) if temps else 0.0
 
 
@@ -329,7 +333,7 @@ def backup_hardware_state(arch: str, governors: dict[str, str],
         "governors": governors,
         "boost_path": boost_path,
         "boost_value": boost_value,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     try:
         with open(BAK_FILE, "w", encoding="utf-8") as fh:
@@ -453,7 +457,7 @@ def compute_guidance(state: DaemonState) -> str:
     all_below = all(p.temperature < threshold for p in points)
     flat_or_down = t_cur <= t_pri
 
-    if all_below and flat_or_down and re_all == 0.0:
+    if all_below and flat_or_down and re_all < 1e-9:
         return "SCALE_UP"
 
     return "HOLD"
@@ -526,7 +530,7 @@ class ThermalRequestHandler(socketserver.StreamRequestHandler):
                 else:
                     self._send({"action": "error", "code": "UNKNOWN_COMMAND"})
 
-        except (OSError, ConnectionResetError):
+        except OSError:
             pass  # Client disconnected abruptly
 
     def finish(self) -> None:
@@ -610,15 +614,15 @@ class ThermalServer(socketserver.ThreadingUnixStreamServer):
     def __init__(
         self,
         server_address_or_socket,
-        RequestHandlerClass,
+        request_handler_class,
         bind_and_activate: bool = True,
     ) -> None:
         if isinstance(server_address_or_socket, socket.socket):
             # Inherited socket from systemd: skip bind/activate
-            socketserver.BaseServer.__init__(self, "", RequestHandlerClass)
+            socketserver.BaseServer.__init__(self, "", request_handler_class)
             self.socket = server_address_or_socket
         else:
-            super().__init__(server_address_or_socket, RequestHandlerClass, bind_and_activate)
+            super().__init__(server_address_or_socket, request_handler_class, bind_and_activate)
 
 
 def _get_systemd_socket() -> Optional[socket.socket]:

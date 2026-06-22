@@ -1,6 +1,7 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
+
 
 [project]
 name = "intelligent-thermal-pacer"
@@ -59,4 +60,4 @@ where = ["."]
 include = ["thermal_pacer*"]
 
 [tool.setuptools.package-data]
-"thermal_pacer" = ["templates/*"]
+"thermal_pacer" = ["templates/*", "../llms.txt", "../llms-full.txt"]

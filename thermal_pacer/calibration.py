@@ -231,19 +231,8 @@ def run_calibration(
         _release_lock(lock_fd, LOCK_FILE)
 
 
-def _run_calibration_locked(
-    config_path: str,
-    telemetry_provider: Optional[TelemetryProvider],
-) -> None:
-    arch = detect_cpu_arch()
-    provider: TelemetryProvider = telemetry_provider or LiveTelemetryProvider(
-        enable_nvidia=True
-    )
-    raw_cfg = _load_raw_config(config_path)
-
-    # -----------------------------------------------------------------------
-    # Step 1: Chronological validity check (§7-1)
-    # -----------------------------------------------------------------------
+def _check_chronological_validity(raw_cfg: dict) -> bool:
+    """Check if the calibration has expired (§7-1)."""
     cal_diag = raw_cfg.get("calibration_diagnostics", {})
     last_cal_str: str = cal_diag.get("last_calibration_utc", "")
     if last_cal_str:
@@ -259,30 +248,18 @@ def _run_calibration_locked(
                     f"Next calibration available in {remaining} day(s). Aborting.",
                     file=sys.stderr,
                 )
-                return
+                return False
         except ValueError:
             pass  # Unparseable timestamp – proceed with calibration
+    return True
 
-    print("[Calibration] Chronological check passed. Starting calibration protocol.")
 
-    # Snapshot governors and boost before modifying them
-    baseline_governors = read_governors()
-
-    # -----------------------------------------------------------------------
-    # Phase 1: Idle Baseline (§7-2)
-    # -----------------------------------------------------------------------
-    print(f"[Calibration] Phase 1 – Idle baseline ({IDLE_PHASE_SECONDS}s)…")
-    t_idle = _sample_mean_temp(provider, IDLE_PHASE_SECONDS)
-    print(f"[Calibration] Phase 1 done. T_idle = {t_idle:.1f}°C")
-
-    # -----------------------------------------------------------------------
-    # Phase 2: Eco Thermal Profile (§7-3)
-    # -----------------------------------------------------------------------
+def _run_phase2_eco(provider: TelemetryProvider, arch: str, t_idle: float) -> float:
+    """Phase 2 – Eco profile: powersave + boost off, 60s load (§7-3)."""
     print(f"[Calibration] Phase 2 – Eco profile ({STRESS_PHASE_SECONDS}s)…")
     set_all_governors("powersave")
     write_boost_state(arch, enabled=False)
 
-    # Run stress load in background, sample temperature simultaneously
     import threading
 
     t_eco_readings: list[float] = []
@@ -292,8 +269,6 @@ def _run_calibration_locked(
         while not phase2_done.is_set():
             t_eco_readings.append(provider.get_critical_temperature())
             time.sleep(1.0)
-
-    stress_future: list[concurrent.futures.Future] = []
 
     sampler_thread = threading.Thread(target=_phase2_sampler, daemon=True)
     sampler_thread.start()
@@ -308,14 +283,21 @@ def _run_calibration_locked(
 
     t_eco = sum(t_eco_readings) / len(t_eco_readings) if t_eco_readings else t_idle
     print(f"[Calibration] Phase 2 done. T_eco = {t_eco:.1f}°C")
+    return t_eco
 
-    # -----------------------------------------------------------------------
-    # Phase 3: Peak Thermal Profile (§7-4)
-    # -----------------------------------------------------------------------
+
+def _run_phase3_peak(
+    provider: TelemetryProvider,
+    arch: str,
+    baseline_governors: dict[str, str],
+    t_eco: float,
+) -> tuple[float, float]:
+    """Phase 3 – Peak profile: restore default governors + boost on, 60s load (§7-4)."""
     print(f"[Calibration] Phase 3 – Peak profile ({STRESS_PHASE_SECONDS}s)…")
-    # Restore default performance governors and enable boost
     write_governors(baseline_governors)
     write_boost_state(arch, enabled=True)
+
+    import threading
 
     t_peak_readings: list[tuple[float, float]] = []  # (timestamp, temp)
     phase3_done = threading.Event()
@@ -338,7 +320,6 @@ def _run_calibration_locked(
 
     t_peak = max((t for _, t in t_peak_readings), default=t_eco)
 
-    # Ramp velocity: max ΔT/Δt between consecutive samples
     max_ramp_vel = 0.0
     for i in range(1, len(t_peak_readings)):
         dt = t_peak_readings[i][0] - t_peak_readings[i - 1][0]
@@ -350,10 +331,18 @@ def _run_calibration_locked(
 
     print(f"[Calibration] Phase 3 done. T_peak = {t_peak:.1f}°C  "
           f"Ramp = {max_ramp_vel:.2f}°C/s")
+    return t_peak, max_ramp_vel
 
-    # -----------------------------------------------------------------------
-    # Step 5: Algorithmic Evaluation (§7-5)
-    # -----------------------------------------------------------------------
+
+def _evaluate_calibration_results(
+    raw_cfg: dict,
+    t_idle: float,
+    t_eco: float,
+    t_peak: float,
+    max_ramp_vel: float,
+    config_path: str,
+) -> None:
+    """Evaluate and conditionally update configuration based on results (§7-5)."""
     t_calculated = t_eco + CALCULATED_OFFSET_CELSIUS
     print(f"[Calibration] T_calculated = {t_eco:.1f} + {CALCULATED_OFFSET_CELSIUS} "
           f"= {t_calculated:.1f}°C")
@@ -362,19 +351,14 @@ def _run_calibration_locked(
         raw_cfg.get("thermal_settings", {}).get("max_target_temp", math.inf)
     )
 
-    updated = False
-
-    # Restrictive Principle: overwrite only if calculated is MORE restrictive
     if t_calculated < current_max_target:
         raw_cfg.setdefault("thermal_settings", {})["max_target_temp"] = round(t_calculated, 1)
         print(f"[Calibration] max_target_temp updated: "
               f"{current_max_target:.1f}°C → {t_calculated:.1f}°C (more restrictive).")
-        updated = True
     else:
         print(f"[Calibration] max_target_temp kept at {current_max_target:.1f}°C "
               f"(T_calculated={t_calculated:.1f}°C is not more restrictive).")
 
-    # Thermal efficiency rating
     if max_ramp_vel > THERMAL_RAMP_CRITICAL_CELSIUS_PER_SEC:
         raw_cfg.setdefault("calibration_diagnostics", {})
         raw_cfg["calibration_diagnostics"]["thermal_efficiency_rating"] = "CRITICAL_COMPACT_CHASSIS"
@@ -391,16 +375,12 @@ def _run_calibration_locked(
         )
         print(f"[Calibration] CRITICAL_COMPACT_CHASSIS rating set "
               f"(ramp={max_ramp_vel:.2f}°C/s).")
-        updated = True
 
-    # Update last_calibration_utc
-    now_iso = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     raw_cfg.setdefault("calibration_diagnostics", {})["last_calibration_utc"] = now_iso
-    updated = True
 
-    if updated:
-        _save_raw_config(raw_cfg, config_path)
-        print(f"[Calibration] Configuration saved to {config_path}.")
+    _save_raw_config(raw_cfg, config_path)
+    print(f"[Calibration] Configuration saved to {config_path}.")
 
     print("[Calibration] Protocol complete.")
     print(f"  T_idle   = {t_idle:.1f}°C")
@@ -408,3 +388,31 @@ def _run_calibration_locked(
     print(f"  T_peak   = {t_peak:.1f}°C")
     print(f"  T_calc   = {t_calculated:.1f}°C")
     print(f"  Ramp vel = {max_ramp_vel:.2f}°C/s")
+
+
+def _run_calibration_locked(
+    config_path: str,
+    telemetry_provider: Optional[TelemetryProvider],
+) -> None:
+    arch = detect_cpu_arch()
+    provider: TelemetryProvider = telemetry_provider or LiveTelemetryProvider(
+        enable_nvidia=True
+    )
+    raw_cfg = _load_raw_config(config_path)
+
+    if not _check_chronological_validity(raw_cfg):
+        return
+
+    print("[Calibration] Chronological check passed. Starting calibration protocol.")
+
+    baseline_governors = read_governors()
+
+    print(f"[Calibration] Phase 1 – Idle baseline ({IDLE_PHASE_SECONDS}s)…")
+    t_idle = _sample_mean_temp(provider, IDLE_PHASE_SECONDS)
+    print(f"[Calibration] Phase 1 done. T_idle = {t_idle:.1f}°C")
+
+    t_eco = _run_phase2_eco(provider, arch, t_idle)
+
+    t_peak, max_ramp_vel = _run_phase3_peak(provider, arch, baseline_governors, t_eco)
+
+    _evaluate_calibration_results(raw_cfg, t_idle, t_eco, t_peak, max_ramp_vel, config_path)
